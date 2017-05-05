@@ -8,6 +8,9 @@ from pylinkirc import utils, world, conf, structures
 from pylinkirc.log import log
 from pylinkirc.coremods import permissions
 
+# Sets the timeout to wait for as individual servers / the PyLink daemon to start up.
+TCONDITION_TIMEOUT = 2
+
 ### GLOBAL (statekeeping) VARIABLES
 relayusers = defaultdict(dict)
 relayservers = defaultdict(dict)
@@ -32,18 +35,18 @@ def initialize_all(irc):
     # Wait for all IRC objects to be created first. This prevents
     # relay servers from being spawned too early (before server authentication),
     # which would break connections.
-    world.started.wait(2)
+    if world.started.wait(TCONDITION_TIMEOUT):
+        if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
+            for chanpair, entrydata in db.items():
+                # Iterate over all the channels stored in our relay links DB.
+                network, channel = chanpair
 
-    with db_lock:
-        for chanpair, entrydata in db.items():
-            # Iterate over all the channels stored in our relay links DB.
-            network, channel = chanpair
-
-            # Initialize each relay channel on their home network, and on every linked one too.
-            initialize_channel(irc, channel)
-            for link in entrydata['links']:
-                network, channel = link
+                # Initialize each relay channel on their home network, and on every linked one too.
                 initialize_channel(irc, channel)
+                for link in entrydata['links']:
+                    network, channel = link
+                    initialize_channel(irc, channel)
+            db_lock.release()
 
 def main(irc=None):
     """Main function, called during plugin loading at start."""
@@ -212,37 +215,40 @@ def get_prefix_modes(irc, remoteirc, channel, user, mlist=None):
     return modes
 
 def spawn_relay_server(irc, remoteirc):
-    irc.connected.wait(5)
-    try:
-        # ENDBURST is delayed by 3 secs on supported IRCds to prevent
-        # triggering join-flood protection and the like.
-        suffix = conf.conf.get('relay', {}).get('server_suffix', 'relay')
-        # Strip any leading or trailing .'s
-        suffix = suffix.strip('.')
-        sid = irc.proto.spawnServer('%s.%s' % (remoteirc.name, suffix),
-                                    desc="PyLink Relay network - %s" %
-                                    (remoteirc.getFullNetworkName()), endburst_delay=3)
-    except (RuntimeError, ValueError):  # Network not initialized yet, or a server name conflict.
-        log.exception('(%s) Failed to spawn server for %r (possible jupe?):',
-                      irc.name, remoteirc.name)
-        # We will just bail here. Disconnect the bad network.
-        irc.disconnect()
-        return
+    if irc.connected.wait(TCONDITION_TIMEOUT):
+        try:
+            # ENDBURST is delayed by 3 secs on supported IRCds to prevent
+            # triggering join-flood protection and the like.
+            suffix = conf.conf.get('relay', {}).get('server_suffix', 'relay')
+            # Strip any leading or trailing .'s
+            suffix = suffix.strip('.')
+            sid = irc.proto.spawnServer('%s.%s' % (remoteirc.name, suffix),
+                                        desc="PyLink Relay network - %s" %
+                                        (remoteirc.getFullNetworkName()), endburst_delay=3)
+        except (RuntimeError, ValueError):  # Network not initialized yet, or a server name conflict.
+            log.exception('(%s) Failed to spawn server for %r (possible jupe?):',
+                          irc.name, remoteirc.name)
+            # We will just bail here. Disconnect the bad network.
+            irc.disconnect()
+            return
 
-    # Mark the server as a relay server
-    irc.servers[sid].remote = remoteirc.name
+        # Mark the server as a relay server
+        irc.servers[sid].remote = remoteirc.name
 
-    # Assign the newly spawned server as our relay server for the target net.
-    relayservers[irc.name][remoteirc.name] = sid
+        # Assign the newly spawned server as our relay server for the target net.
+        relayservers[irc.name][remoteirc.name] = sid
 
-    return sid
+        return sid
+    else:
+        log.debug('(%s) skipping spawn_relay_server(%s, %s); the remote is not ready yet',
+                  irc.name, irc.name, remoteirc.name)
 
 def get_remote_sid(irc, remoteirc, spawn_if_missing=True):
     """Gets the remote server SID representing remoteirc on irc, spawning
     it if it doesn't exist (and spawn_if_missing is enabled)."""
 
     log.debug('(%s) Grabbing spawnlocks_servers[%s]', irc.name, irc.name)
-    if spawnlocks_servers[irc.name].acquire(5):
+    if spawnlocks_servers[irc.name].acquire(timeout=TCONDITION_TIMEOUT):
         try:
             sid = relayservers[irc.name][remoteirc.name]
         except KeyError:
@@ -346,36 +352,38 @@ def get_remote_user(irc, remoteirc, user, spawn_if_missing=True, times_tagged=0)
     spawning one if it doesn't exist and spawn_if_missing is True."""
 
     # Wait until the network is working before trying to spawn anything.
-    irc.connected.wait(5)
+    if irc.connected.wait(TCONDITION_TIMEOUT):
+        # Don't spawn clones for registered service bots.
+        sbot = irc.getServiceBot(user)
+        if sbot:
+            return sbot.uids.get(remoteirc.name)
 
-    # Don't spawn clones for registered service bots.
-    sbot = irc.getServiceBot(user)
-    if sbot:
-        return sbot.uids.get(remoteirc.name)
+        log.debug('(%s) Grabbing spawnlocks[%s]', irc.name, irc.name)
+        if spawnlocks[irc.name].acquire(timeout=TCONDITION_TIMEOUT):
+            # Be sort-of thread safe: lock the user spawns for the current net first.
+            u = None
+            try:
+                # Look up the existing user, stored here as dict entries in the format:
+                # {('ournet', 'UID'): {'remotenet1': 'UID1', 'remotenet2': 'UID2'}}
+                u = relayusers[(irc.name, user)][remoteirc.name]
+            except KeyError:
+                # User doesn't exist. Spawn a new one if requested.
+                if spawn_if_missing:
+                    u = spawn_relay_user(irc, remoteirc, user, times_tagged=times_tagged)
 
-    log.debug('(%s) Grabbing spawnlocks[%s]', irc.name, irc.name)
-    if spawnlocks[irc.name].acquire(5):
-        # Be sort-of thread safe: lock the user spawns for the current net first.
-        u = None
-        try:
-            # Look up the existing user, stored here as dict entries in the format:
-            # {('ournet', 'UID'): {'remotenet1': 'UID1', 'remotenet2': 'UID2'}}
-            u = relayusers[(irc.name, user)][remoteirc.name]
-        except KeyError:
-            # User doesn't exist. Spawn a new one if requested.
-            if spawn_if_missing:
+            # This is a sanity check to make sure netsplits and other state resets
+            # don't break the relayer. If it turns out there was a client in our relayusers
+            # cache for the requested UID, but it doesn't match the request,
+            # assume it was a leftover from the last split and replace it with a new one.
+            if u and ((u not in remoteirc.users) or remoteirc.users[u].remote != (irc.name, user)):
                 u = spawn_relay_user(irc, remoteirc, user, times_tagged=times_tagged)
 
-        # This is a sanity check to make sure netsplits and other state resets
-        # don't break the relayer. If it turns out there was a client in our relayusers
-        # cache for the requested UID, but it doesn't match the request,
-        # assume it was a leftover from the last split and replace it with a new one.
-        if u and ((u not in remoteirc.users) or remoteirc.users[u].remote != (irc.name, user)):
-            u = spawn_relay_user(irc, remoteirc, user, times_tagged=times_tagged)
+            spawnlocks[irc.name].release()
 
-        spawnlocks[irc.name].release()
-
-        return u
+            return u
+    else:
+        log.debug('(%s) skipping spawn_relay_user(%s, %s, %s, ...); the remote is not ready yet',
+                  irc.name, irc.name, remoteirc.name, user)
 
 def get_orig_user(irc, user, targetirc=None):
     """
@@ -414,13 +422,14 @@ def get_orig_user(irc, user, targetirc=None):
 def get_relay(chanpair):
     """Finds the matching relay entry name for the given (network name, channel)
     pair, if one exists."""
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         if chanpair in db:  # This chanpair is a shared channel; others link to it
             return chanpair
         # This chanpair is linked *to* a remote channel
         for name, dbentry in db.items():
             if chanpair in dbentry['links']:
                 return name
+        db_lock.release()
 
 def get_remote_channel(irc, remoteirc, channel):
     """Returns the linked channel name for the given channel on remoteirc,
@@ -433,10 +442,11 @@ def get_remote_channel(irc, remoteirc, channel):
     if chanpair[0] == remotenetname:
         return chanpair[1]
     else:
-        with db_lock:
+        if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
             for link in db[chanpair]['links']:
                 if link[0] == remotenetname:
                     return link[1]
+            db_lock.release()
 
 def initialize_channel(irc, channel):
     """Initializes a relay channel (merge local/remote users, set modes, etc.)."""
@@ -447,9 +457,10 @@ def initialize_channel(irc, channel):
     log.debug('(%s) relay.initialize_channel: relay pair found to be %s', irc.name, relay)
     queued_users = []
     if relay:
-        with db_lock:
+        if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
             all_links = db[relay]['links'].copy()
             all_links.update((relay,))
+            db_lock.release()
         log.debug('(%s) relay.initialize_channel: all_links: %s', irc.name, all_links)
 
         # Iterate over all the remote channels linked in this relay.
@@ -533,12 +544,14 @@ def check_claim(irc, channel, sender, chanobj=None):
               sender, channel, sender_modes, mlist)
 
     # XXX: stop hardcoding modes to check for and support mlist in isHalfopPlus and friends
-    with db_lock:
-        return (not relay) or irc.name == relay[0] or not db[relay]['claim'] or \
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
+        result = (not relay) or irc.name == relay[0] or not db[relay]['claim'] or \
             irc.name in db[relay]['claim'] or \
             any([mode in sender_modes for mode in ('y', 'q', 'a', 'o', 'h')]) \
             or irc.isInternalClient(sender) or \
             irc.isInternalServer(sender)
+        db_lock.release()
+        return result
 
 def get_supported_umodes(irc, remoteirc, modes):
     """Given a list of user modes, filters out all of those not supported by the
@@ -945,7 +958,7 @@ def handle_quit(irc, numeric, command, args):
     # Lock the user spawning mechanism before proceeding, since we're going to be
     # deleting client from the relayusers cache.
     log.debug('(%s) Grabbing spawnlocks[%s]', irc.name, irc.name)
-    if spawnlocks[irc.name].acquire(5):
+    if spawnlocks[irc.name].acquire(timeout=TCONDITION_TIMEOUT):
         for netname, user in relayusers[(irc.name, numeric)].copy().items():
             remoteirc = world.networkobjects[netname]
             try:  # Try to quit the client. If this fails because they're missing, bail.
@@ -1476,7 +1489,7 @@ def handle_disconnect(irc, numeric, command, args):
     # Quit all of our users' representations on other nets, and remove
     # them from our relay clients index.
     log.debug('(%s) Grabbing spawnlocks[%s]', irc.name, irc.name)
-    if spawnlocks[irc.name].acquire(5):
+    if spawnlocks[irc.name].acquire(timeout=TCONDITION_TIMEOUT):
         for k, v in relayusers.copy().items():
             if irc.name in v:
                 del relayusers[k][irc.name]
@@ -1487,7 +1500,7 @@ def handle_disconnect(irc, numeric, command, args):
     # SQUIT all relay pseudoservers spawned for us, and remove them
     # from our relay subservers index.
     log.debug('(%s) Grabbing spawnlocks_servers[%s]', irc.name, irc.name)
-    if spawnlocks_servers[irc.name].acquire(5):
+    if spawnlocks_servers[irc.name].acquire(timeout=TCONDITION_TIMEOUT):
         for name, ircobj in world.networkobjects.copy().items():
             if name != irc.name:
                 try:
@@ -1511,7 +1524,7 @@ def handle_disconnect(irc, numeric, command, args):
     announcement = conf.conf.get('relay', {}).get('disconnect_announcement')
     log.debug('(%s) relay: last connection successful: %s', irc.name, args.get('was_successful'))
     if announcement and args.get('was_successful'):
-        with db_lock:
+        if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
             for chanpair, entrydata in db.items():
                 log.debug('(%s) relay: Looking up %s', irc.name, chanpair)
                 if chanpair[0] == irc.name:
@@ -1524,6 +1537,7 @@ def handle_disconnect(irc, numeric, command, args):
                                 {'homenetwork': irc.name, 'homechannel': chanpair[1],
                                  'network': remoteirc.name, 'channel': leaf[1]})
                             remoteirc.msg(leaf[1], text, loopback=False)
+            db_lock.release()
 
 utils.add_hook(handle_disconnect, "PYLINK_DISCONNECT")
 
@@ -1601,10 +1615,11 @@ def create(irc, source, args):
     creator = irc.getHostmask(source)
     # Create the relay database entry with the (network name, channel name)
     # pair - this is just a dict with various keys.
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         db[(irc.name, channel)] = {'claim': [irc.name], 'links': set(),
                                    'blocked_nets': set(), 'creator': creator,
                                    'ts': time.time()}
+        db_lock.release()
     log.info('(%s) relay: Channel %s created by %s.', irc.name, channel, creator)
     initialize_channel(irc, channel)
     irc.reply('Done.')
@@ -1614,10 +1629,11 @@ def stop_relay(entry):
     """Internal function to deinitialize a relay link and its leaves."""
     network, channel = entry
     # Iterate over all the channel links and deinitialize them.
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         for link in db[entry]['links']:
             remove_channel(world.networkobjects.get(link[0]), link[1])
         remove_channel(world.networkobjects.get(network), channel)
+        db_lock.release()
 
 def destroy(irc, source, args):
     """[<home network>] <channel>
@@ -1647,7 +1663,7 @@ def destroy(irc, source, args):
 
     entry = (network, channel)
 
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         if entry in db:
             stop_relay(entry)
             del db[entry]
@@ -1659,6 +1675,7 @@ def destroy(irc, source, args):
             irc.error("No such channel %r exists. If you're trying to delink a channel from "
                       "another network, use the DESTROY command." % channel)
             return
+        db_lock.release()
 destroy = utils.add_cmd(destroy, featured=True)
 
 @utils.add_cmd
@@ -1675,7 +1692,7 @@ def purge(irc, source, args):
 
     count = 0
 
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         for entry in db.copy():
             # Entry was owned by the target network; remove it
             if entry[0] == network:
@@ -1689,8 +1706,9 @@ def purge(irc, source, args):
                         count += 1
                         remove_channel(world.networkobjects.get(network), link[1])
                         db[entry]['links'].remove(link)
+        db_lock.release()
 
-    irc.reply("Done. Purged %s entries involving the network %s." % (count, network))
+        irc.reply("Done. Purged %s entries involving the network %s." % (count, network))
 
 link_parser = utils.IRCParser()
 link_parser.add_argument('remotenet')
@@ -1751,8 +1769,9 @@ def link(irc, source, args):
         return
 
     try:
-        with db_lock:
+        if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
             entry = db[(remotenet, channel)]
+            db_lock.release()
     except KeyError:
         irc.error('No such relay %r exists.' % args.channel)
         return
@@ -1826,15 +1845,17 @@ def delink(irc, source, args):
                           "network).")
                 return
             else:
-                with db_lock:
+                if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
                     for link in db[entry]['links'].copy():
                         if link[0] == remotenet:
                             remove_channel(world.networkobjects.get(remotenet), link[1])
                             db[entry]['links'].remove(link)
+                    db_lock.release()
         else:
             remove_channel(irc, channel)
-            with db_lock:
+            if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
                 db[entry]['links'].remove((irc.name, channel))
+                db_lock.release()
         irc.reply('Done.')
         log.info('(%s) relay: Channel %s delinked from %s%s by %s.', irc.name,
                  channel, entry[0], entry[1], irc.getHostmask(source))
@@ -1871,7 +1892,7 @@ def linked(irc, source, args):
         irc.reply("Showing channels linked to %s:" % net, private=True)
 
     # Sort the list of shared channels when displaying
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         for k, v in sorted(db.items()):
 
             # Skip if we're filtering by network and the network given isn't relayed
@@ -1924,6 +1945,7 @@ def linked(irc, source, args):
 
                 if s:  # Indent to make the list look nicer
                     irc.reply('    Channel created%s.' % s, private=True)
+        db_lock.release()
 linked = utils.add_cmd(linked, featured=True)
 
 @utils.add_cmd
@@ -1949,7 +1971,7 @@ def linkacl(irc, source, args):
         irc.error('No such relay %r exists.' % channel)
         return
 
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         if cmd == 'list':
             permissions.checkPermissions(irc, source, ['relay.linkacl.view'])
             s = 'Blocked networks for \x02%s\x02: \x02%s\x02' % (channel, ', '.join(db[relay]['blocked_nets']) or '(empty)')
@@ -1974,6 +1996,7 @@ def linkacl(irc, source, args):
                 irc.reply('Done.')
         else:
             irc.error('Unknown subcommand %r: valid ones are ALLOW, DENY, and LIST.' % cmd)
+        db_lock.release()
 
 @utils.add_cmd
 def showuser(irc, source, args):
@@ -2076,7 +2099,7 @@ def claim(irc, source, args):
 
     # We override get_relay() here to limit the search to the current network.
     relay = (irc.name, channel)
-    with db_lock:
+    if db_lock.acquire(timeout=TCONDITION_TIMEOUT):
         if relay not in db:
             irc.error('No relay %r exists on this network (this command must be run on the '
                       'network this channel was created on).' % channel)
@@ -2095,3 +2118,4 @@ def claim(irc, source, args):
             db[relay]["claim"] = claimed
             irc.reply('CLAIM for channel \x02%s\x02 set to: %s' %
                     (channel, ', '.join(claimed) or '\x1D(none)\x1D'))
+        db_lock.release()
